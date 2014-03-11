@@ -1,4 +1,7 @@
-﻿using AnotherJiraRestClient.JiraModel;
+﻿using System;
+using System.Linq;
+using AnotherJiraRestClient.JiraModel;
+using Newtonsoft.Json;
 using RestSharp;
 using System.Collections.Generic;
 using System.Net;
@@ -41,8 +44,35 @@ namespace AnotherJiraRestClient
             // Won't throw exception.
             var response = client.Execute<T>(request);
 
-            if (response.ResponseStatus != ResponseStatus.Completed || response.ErrorException != null)
-               throw new JiraApiException(string.Format("RestSharp response status: {0} - HTTP response: {1} - {2} - {3}", response.ResponseStatus, response.StatusCode, response.StatusDescription, response.Content));
+            if (response.ResponseStatus != ResponseStatus.Completed || response.ErrorException != null || !response.IsSuccessStatusCode())
+            {
+                // Most JRIA error responses return an errorMessages collection.  Try to parse that out here.
+                var errorMessages = Enumerable.Empty<string>();
+                try
+                {
+                    var jiraErrorReponse = JsonConvert.DeserializeObject<JiraErrorResponse>(response.Content);
+                    if (jiraErrorReponse != null && jiraErrorReponse.errorMessages != null)
+                    {
+                        errorMessages = jiraErrorReponse.errorMessages;
+                    }
+                }
+                catch (Exception)
+                {
+                }
+                
+                var message = string.Format(
+                    "RestSharp response status: {0} - HTTP response: {1} - {2}. See ErrorMessages property for more information.",
+                    response.ResponseStatus,
+                    response.StatusCode,
+                    response.StatusDescription);
+                
+                throw new JiraApiException(message)
+                {
+                    RawResponseContent = response.Content,
+                    ResponseStatusCode = (int)response.StatusCode,
+                    ErrorMessages = errorMessages
+                };
+            }
 
             return response.Data;
         }
@@ -75,31 +105,66 @@ namespace AnotherJiraRestClient
         public Issue GetIssue(string issueKey, IEnumerable<string> fields = null)
         {
             var fieldsString = ToCommaSeparatedString(fields);
-            
+
             var request = new RestRequest();
             request.Resource = string.Format("{0}?fields={1}", ResourceUrls.IssueByKey(issueKey), fieldsString);
             request.Method = Method.GET;
-            
+
             var issue = Execute<Issue>(request, HttpStatusCode.OK);
             return issue.fields != null ? issue : null;
         }
 
         /// <summary>
-        /// Searches for Issues using JQL. Throws a JiraApiException if the request 
-        /// was unable to execute.
+        /// Searches for Issues using JQL using the HTTP POST verb. Throws a JiraApiException if the request was unable to execute.
+        /// </summary>
+        /// <param name="jql">A JQL search string</param>
+        /// <param name="startAt">The index in the record set to start returning data from.</param>
+        /// <param name="maxResults">The max number of results to retrieve.</param>
+        /// <param name="useHttpPost">When true, the request will use the HTTP POST verb instead of GET.</param>
+        /// <param name="fields">An optional collection of fields to include.</param>
+        /// <returns>The search results</returns>
+        public Issues GetIssuesByJql(string jql, int startAt, int maxResults, bool useHttpPost, params string[] fields)
+        {
+            if (!useHttpPost)
+            {
+                return GetIssuesByJql(jql, startAt, maxResults, fields);
+            }
+
+            var requestBody = new IssueSearchRequest
+            {
+                jql = jql,
+                startAt = startAt,
+                maxResults = maxResults,
+                fields = fields
+            };
+            var request = new RestRequest
+            {
+                Resource = ResourceUrls.Search(),
+                Method = Method.POST,
+                RequestFormat = DataFormat.Json
+            };
+            request.AddBody(requestBody);
+            return Execute<Issues>(request, HttpStatusCode.OK);
+        }
+
+        /// <summary>
+        /// Searches for Issues using JQL using the HTTP GET verb. Throws a JiraApiException if the request was unable to execute.
         /// </summary>
         /// <param name="jql">a JQL search string</param>
+        /// <param name="startAt">The index in the record set to start returning data from.</param>
+        /// <param name="maxResults">The max number of results to retrieve.</param>
+        /// <param name="fields">An optional collection of fields to include.</param>
         /// <returns>The search results</returns>
-        public Issues GetIssuesByJql(string jql, int startAt, int maxResults, IEnumerable<string> fields = null)
+        public Issues GetIssuesByJql(string jql, int startAt, int maxResults, params string[] fields)
         {
             var request = new RestRequest();
             request.Resource = ResourceUrls.Search();
             request.AddParameter(new Parameter()
-                {
-                    Name = "jql",
-                    Value = jql,
-                    Type = ParameterType.GetOrPost
-                });
+            {
+                Name = "jql",
+                Value = jql,
+                Type = ParameterType.GetOrPost
+            });
             request.AddParameter(new Parameter()
             {
                 Name = "fields",
@@ -127,8 +192,11 @@ namespace AnotherJiraRestClient
         /// a JiraApiException if the request was unable to execute.
         /// </summary>
         /// <param name="projectKey">project key</param>
+        /// <param name="startAt">The index in the record set to start returning data from.</param>
+        /// <param name="maxResults">The max number of results to retrieve.</param>
+        /// <param name="fields">An optional collection of fields to include.</param>
         /// <returns>the Issues of the specified project</returns>
-        public Issues GetIssuesByProject(string projectKey, int startAt, int maxResults, IEnumerable<string> fields = null)
+        public Issues GetIssuesByProject(string projectKey, int startAt, int maxResults, params string[] fields)
         {
             return GetIssuesByJql("project=" + projectKey, startAt, maxResults, fields);
         }
@@ -148,7 +216,7 @@ namespace AnotherJiraRestClient
             };
 
             return Execute<List<Project>>(request, HttpStatusCode.OK);
-        } 
+        }
 
         /// <summary>
         /// Returns a list of all possible priorities.  Throws
@@ -174,10 +242,12 @@ namespace AnotherJiraRestClient
         {
             var request = new RestRequest();
             request.Resource = ResourceUrls.CreateMeta();
-            request.AddParameter(new Parameter() 
-              { Name = "projectKeys", 
-                Value = projectKey, 
-                Type = ParameterType.GetOrPost });
+            request.AddParameter(new Parameter()
+              {
+                  Name = "projectKeys",
+                  Value = projectKey,
+                  Type = ParameterType.GetOrPost
+              });
             request.Method = Method.GET;
             var createMeta = Execute<IssueCreateMeta>(request, HttpStatusCode.OK);
             if (createMeta.projects[0].key != projectKey || createMeta.projects.Count != 1)
@@ -231,7 +301,7 @@ namespace AnotherJiraRestClient
                 Resource = ResourceUrls.ApplicationProperties(),
                 RequestFormat = DataFormat.Json
             };
-            
+
             request.AddParameter(new Parameter()
             {
                 Name = "key",
